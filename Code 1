@@ -1,0 +1,210 @@
+import os
+import warnings
+import pandas as pd
+import numpy as np
+import re
+import math
+import random
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve
+
+# 依赖版本兼容导入
+try:
+    import xgboost as xgb
+    HAS_XGB = True
+except ImportError:
+    HAS_XGB = False
+    warnings.warn("未安装 xgboost，模型训练部分将被跳过。请执行: pip install xgboost")
+
+try:
+    from imblearn.over_sampling import SMOTE, ADASYN
+    from imblearn.combine import SMOTETomek, SMOTEENN
+    HAS_IMBLEARN = True
+except ImportError:
+    HAS_IMBLEARN = False
+    warnings.warn("未安装 imbalanced-learn，采样部分将被跳过。请执行: pip install imbalanced-learn")
+
+import matplotlib
+import matplotlib.pyplot as plt
+try:
+    import seaborn as sns
+    HAS_SNS = True
+except ImportError:
+    HAS_SNS = False
+
+# 设置随机种子
+SEED = 42
+np.random.seed(SEED)
+random.seed(SEED)
+
+# ---------------------------
+# 1. 读取数据
+# ---------------------------
+data_path = "Vehicle Insurance Fraud Detection.xlsx"   # <-- 如需修改路径，改这里
+if not os.path.exists(data_path):
+    raise FileNotFoundError(
+        f"找不到数据文件: {os.path.abspath(data_path)}\n"
+        "请将 Excel 文件放到脚本同级目录，或修改 data_path 变量。"
+    )
+df = pd.read_excel(data_path)
+print(f"数据维度: {df.shape[0]} 行, {df.shape[1]} 列")
+fraud_rate = (df["FraudFound"] == "Yes").mean()
+print(f"欺诈率: {fraud_rate*100:.2f}%")
+
+# ---------------------------
+# 2. 数据清洗
+# ---------------------------
+def preprocess_data(df_raw):
+    data = df_raw.copy()
+    if "PolicyNumber" in data.columns:
+        data = data.drop("PolicyNumber", axis=1)
+        print("已删除 PolicyNumber 列")
+
+    if "Age" in data.columns:
+        data.loc[data["Age"] == 0, "Age"] = np.nan
+
+    # 数值列：中位数填充
+    numeric_cols = data.select_dtypes(include=[np.number]).columns.tolist()
+    for col in numeric_cols:
+        if data[col].isna().any():
+            med = data[col].median()
+            data[col] = data[col].fillna(med)
+
+    # 字符列：众数填充（用 pandas.mode，兼容所有 scipy 版本）
+    # 用 exclude=[np.number] 选择非数值列，兼容 pandas 2/3 的 str dtype 迁移，避免 Pandas4Warning
+    char_cols = data.select_dtypes(exclude=[np.number]).columns.tolist()
+    for col in char_cols:
+        if data[col].isna().any():
+            m = data[col].mode(dropna=True)
+            if len(m) > 0:
+                data[col] = data[col].fillna(m.iloc[0])
+
+    # 如果第一行是重复表头，则删掉
+    if "Month" in data.columns and len(data) > 0:
+        first_val = data["Month"].iloc[0]
+        if pd.notna(first_val) and str(first_val).strip().lower() == "month":
+            data = data.iloc[1:, :].reset_index(drop=True)
+    return data.reset_index(drop=True)
+
+# ---------------------------
+# 3. 特征工程
+# ---------------------------
+def feature_engineering(data):
+    df = data.copy()
+    df["FraudFound"] = df["FraudFound"].astype("category")
+
+    def convert_range_to_numeric(x):
+        res = np.full(len(x), np.nan)
+        for i, val in enumerate(x):
+            if pd.isna(val):
+                continue
+            s = str(val).strip().lower()
+            if s in ["none", "na", ""]:
+                res[i] = 0
+                continue
+            if "more than" in s:
+                nums = re.findall(r"\d+", s)
+                if len(nums) > 0:
+                    res[i] = int(nums[0]) + 1
+                continue
+            if "to" in s and re.search(r"\d", s):
+                nums = [int(v) for v in re.findall(r"-?\d+", s)]
+                if len(nums) >= 2:
+                    res[i] = np.mean(nums[:2])
+                continue
+            if "year" in s:
+                nums = re.findall(r"\d+", s)
+                if len(nums) > 0:
+                    res[i] = int(nums[0])
+                continue
+            try:
+                res[i] = float(val)
+            except (ValueError, TypeError):
+                pass
+        return res
+
+    range_cols = [
+        "AgeOfVehicle", "AgeOfPolicyHolder", "VehiclePrice",
+        "Days:Policy-Accident", "Days:Policy-Claim",
+        "PastNumberOfClaims", "NumberOfSuppliments",
+        "AddressChange-Claim", "NumberOfCars"
+    ]
+    for col in range_cols:
+        if col in df.columns:
+            new_col = col + "_num"
+            df[new_col] = convert_range_to_numeric(df[col])
+            if df[new_col].isna().any():
+                med = df[new_col].median()
+                df[new_col] = df[new_col].fillna(med)
+
+    month_map = {"Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,
+                 "Jul":7,"Aug":8,"Sep":9,"Oct":10,"Nov":11,"Dec":12}
+    if "Month" in df.columns:
+        df["AccidentMonth_num"] = df["Month"].map(month_map)
+    if "MonthClaimed" in df.columns:
+        df["ClaimMonth_num"] = df["MonthClaimed"].map(month_map)
+    if "AccidentMonth_num" in df.columns and "ClaimMonth_num" in df.columns:
+        df["MonthDiff"] = (df["ClaimMonth_num"] - df["AccidentMonth_num"]).abs()
+        df["MonthDiff"] = df["MonthDiff"].fillna(df["MonthDiff"].median())
+
+    if "DayOfWeek" in df.columns:
+        df["IsWeekend"] = df["DayOfWeek"].isin(["Saturday","Sunday"]).astype(int)
+    if "DayOfWeekClaimed" in df.columns:
+        df["IsWeekendClaim"] = df["DayOfWeekClaimed"].isin(["Saturday","Sunday"]).astype(int)
+
+    if "Age" in df.columns:
+        bins = [0,25,35,50,65,100]
+        labels = ["Young","Adult","Middle","Senior","Elderly"]
+        df["AgeGroup"] = pd.cut(df["Age"], bins=bins, labels=labels, right=True)
+
+    if "Make" in df.columns:
+        luxury_brands = ["Accura","BMW","Jaguar","Porche","Mercedes","Lexus"]
+        df["IsLuxuryBrand"] = df["Make"].isin(luxury_brands).astype(int)
+
+    if "PolicyType" in df.columns:
+        df["PolicyTypeSimple"] = df["PolicyType"].astype(str).str.split(" - ").str[0]
+
+    drop_cols = [c for c in range_cols if c in df.columns]
+    df = df.drop(drop_cols, axis=1)
+    return df
+
+df_clean = preprocess_data(df)
+df_featured = feature_engineering(df_clean)
+
+# ---------------------------
+# 4. 特征编码（onehot，版本兼容参数）
+# ---------------------------
+target_col = "FraudFound"
+X = df_featured.drop(target_col, axis=1).copy()
+y = df_featured[target_col].copy()
+
+categorical_cols = X.select_dtypes(exclude=[np.number]).columns.tolist()
+numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+
+for col in categorical_cols:
+    # 先填缺失，再统一转成字符串，避免某列混有 int 和 str 导致 OneHotEncoder 报错
+    X[col] = X[col].astype(object).fillna("Unknown").map(
+        lambda v: str(v) if not isinstance(v, str) else v
+    )
+
+# sklearn < 1.2 用 sparse=，>= 1.2 用 sparse_output=
+try:
+    encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    encoder.fit(pd.DataFrame({"a":["x","y"]}))  # 快速探测参数是否被支持
+except TypeError:
+    encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+preprocessor = ColumnTransformer(
+    transformers=[("cat", encoder, categorical_cols)],
+    remainder="passthrough"
+)
+X_encoded_raw = preprocessor.fit_transform(X)
+feature_names = preprocessor.get_feature_names_out()
+X_encoded = pd.DataFrame(X_encoded_raw, columns=feature_names, index=X.index).fillna(0)
+y_encoded = y.reset_index(drop=True)
+
+scaler = StandardScaler()
+X_scaled_arr = scaler.fit_transform(X_encoded)
+X_scaled = pd.DataFrame(X_scaled_arr, columns=X_encoded.columns)
