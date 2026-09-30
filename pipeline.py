@@ -33,9 +33,9 @@ def preprocess_data(df:pd.DataFrame) -> pd.DataFrame:
     logging.info(f"清洗后数据行数:{df.shape[0]}")
     return df
 
-def feature_engineering(df:pd.DataFrame, target_col="fraud"):
+def feature_engineering(df:pd.DataFrame, target_col="FraudFound"):
     """特征工程，划分X,y，区分类别/数值特征"""
-    y = df[target_col]
+    y = df[target_col].map({"Yes":1, "No":0})
     X = df.drop(columns=[target_col])
     cat_cols = X.select_dtypes(include=["object","category"]).columns.tolist()
     num_cols = X.select_dtypes(include=["int64","float64"]).columns.tolist()
