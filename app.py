@@ -1,3 +1,10 @@
+from dotenv import load_dotenv
+import os
+# 加载.env里面的密钥
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY")
+
+
 from pathlib import Path
 import json
 import numpy as np
@@ -21,7 +28,7 @@ if not (ROOT/'results/metadata.json').exists():
     st.stop()
 meta=metadata()
 data=read_csv('data/vehicle_fraud.csv')
-page=st.sidebar.radio('功能 / Explore', ['Dataset overview','Top 10 features','Original model comparison','Test case explorer','Validation & sharing'])
+page=st.sidebar.radio('功能 / Explore', ['Dataset overview','Top 10 features','Original model comparison','Test case explorer','AI Risk Assistant','Validation & sharing'])
 st.sidebar.info('Top 10 is a display ranking only. Models still use ALL original engineered features.\n\n前十特征仅用于展示，模型输入未删减。')
 
 def download(label, frame, name):
@@ -89,8 +96,75 @@ elif page=='Test case explorer':
     cols[0].metric('Actual label / 真实标签',str(row.Actual))
     cols[1].metric('Model score / 模型分数',f'{row[method]:.4f}')
     cols[2].metric('Original prediction / 原版预测','Yes' if row[method]>.5 else 'No')
+    # 把当前选中样本的模型分数存入session_state，给AI读取
+    st.session_state.current_case_score = f"{row[method]:.4f}"
     st.caption('This displays predictions saved from the original test run. It does not train a new model or accept new claims. Scores are not calibrated real-world fraud probabilities.')
     download('Download this test case',raw.assign(Model=method,Risk_score=row[method]),'test_case.csv')
+
+elif page == 'AI Risk Assistant':
+    st.subheader("🤖 AI Insurance Fraud Analysis Assistant")
+    st.markdown("Ask questions about the vehicle insurance fraud model, predictions and top 10 important features.")
+
+    from openai import OpenAI
+    from dotenv import load_dotenv
+    import os
+    # 加载本地密钥
+    load_dotenv()
+    api_key = os.getenv("OPENAI_API_KEY")
+    client = OpenAI(api_key=api_key)
+
+    # 初始化对话记录
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    if "current_case_score" not in st.session_state:
+        st.session_state.current_case_score = "No test case selected yet"
+
+    # --------------------------
+    # Guardrail 系统提示词（作业核心要求）
+    # --------------------------
+    system_prompt = """
+You are an assistant for this vehicle insurance fraud detection project.
+You MUST obey these rules:
+1. You can ONLY answer questions related to this insurance fraud project, model results, test case prediction, and top10 feature importance.
+2. NEVER provide legal advice, insurance claim settlement advice or financial recommendations.
+3. If user asks irrelevant questions (poem, math, other topics), politely refuse and state you can only answer insurance fraud analysis questions.
+4. Keep your answer concise for class presentation.
+Use the context data given in user's message.
+"""
+    # 读取提前算出的top10特征
+    top_df = read_csv('results/top10_features.csv')
+    top_feature_text = ", ".join(top_df['Feature'].tolist())
+
+    # 用户提问框
+    user_query = st.chat_input("Ask about the fraud model, test case or feature importance...")
+    if user_query:
+        context_info = f"""
+Project Context:
+Best model sampling method: {meta['best_method_by_original_test_auc']}
+Top10 important engineered features: {top_feature_text}
+Currently selected test case fraud score: {st.session_state.current_case_score}
+"""
+        full_msg = f"{context_info}\nUser Question: {user_query}"
+
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": full_msg}
+            ],
+            temperature=0.3
+        )
+        ai_reply = response.choices[0].message.content
+
+        st.session_state.chat_history.append(("user", user_query))
+        st.session_state.chat_history.append(("assistant", ai_reply))
+
+    # 展示聊天记录
+    for role, msg in st.session_state.chat_history:
+        with st.chat_message(role):
+            st.write(msg)
+
+    st.info("💡 Tip: Go to Test case explorer first, pick a test case, then come back here to ask about this specific claim.")
 
 else:
     st.subheader('What changed / 修改范围')
@@ -108,3 +182,4 @@ else:
 ''')
     st.json(meta)
     st.markdown('[Streamlit deployment guide](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy)')
+
