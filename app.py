@@ -108,10 +108,18 @@ elif page == 'AI Risk Assistant':
     from openai import OpenAI
     from dotenv import load_dotenv
     import os
-    # 加载本地密钥
+
     load_dotenv()
-    api_key = os.getenv("OPENAI_API_KEY")
-    client = OpenAI(api_key=api_key)
+    # ========= OpenRouter免费模型配置（课程原版） =========
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+        extra_headers={
+            "HTTP-Referer": "https://localhost",
+            "X-OpenRouter-Title": "Vehicle‑Fraud‑Dashboard"
+        }
+    )
 
     # 初始化对话记录
     if "chat_history" not in st.session_state:
@@ -120,7 +128,7 @@ elif page == 'AI Risk Assistant':
         st.session_state.current_case_score = "No test case selected yet"
 
     # --------------------------
-    # Guardrail 系统提示词（作业核心要求）
+    # Guardrail 系统提示词（作业要求）
     # --------------------------
     system_prompt = """
 You are an assistant for this vehicle insurance fraud detection project.
@@ -140,14 +148,15 @@ Use the context data given in user's message.
     if user_query:
         context_info = f"""
 Project Context:
-Best model sampling method: {meta['best_method_by_original_test_auc']}
+Best sampling method: {meta['best_method_by_original_test_auc']}
 Top10 important engineered features: {top_feature_text}
 Currently selected test case fraud score: {st.session_state.current_case_score}
 """
         full_msg = f"{context_info}\nUser Question: {user_query}"
 
+        # ✅使用OpenRouter免费路由，自动选可用免费模型，0费用
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="openrouter/free",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": full_msg}
@@ -165,6 +174,7 @@ Currently selected test case fraud score: {st.session_state.current_case_score}
             st.write(msg)
 
     st.info("💡 Tip: Go to Test case explorer first, pick a test case, then come back here to ask about this specific claim.")
+
 
 else:
     st.subheader('What changed / 修改范围')
