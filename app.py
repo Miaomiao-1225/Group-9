@@ -110,16 +110,16 @@ elif page == 'AI Risk Assistant':
     import os
 
     load_dotenv()
-    # ========= OpenRouter免费模型配置（课程原版） =========
+    # ========= OpenRouter免费模型配置（修复旧版本openai包兼容问题） =========
     api_key = os.getenv("OPENROUTER_API_KEY")
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
-        api_key=api_key,
-        extra_headers={
-            "HTTP-Referer": "https://localhost",
-            "X-OpenRouter-Title": "Vehicle‑Fraud‑Dashboard"
-        }
+        api_key=api_key
     )
+    headers = {
+        "HTTP-Referer": "https://localhost",
+        "X-OpenRouter-Title": "Vehicle-Fraud-Dashboard"
+    }
 
     # 初始化对话记录
     if "chat_history" not in st.session_state:
@@ -140,7 +140,7 @@ You MUST obey these rules:
 Use the context data given in user's message.
 """
     # 读取提前算出的top10特征
-    top_df = read_csv('results/top10_features.csv')
+    top_df = pd.read_csv('results/top10_features.csv')
     top_feature_text = ", ".join(top_df['Feature'].tolist())
 
     # 用户提问框
@@ -154,14 +154,15 @@ Currently selected test case fraud score: {st.session_state.current_case_score}
 """
         full_msg = f"{context_info}\nUser Question: {user_query}"
 
-        # ✅使用OpenRouter免费路由，自动选可用免费模型，0费用
+        # ✅headers放到create函数里面，兼容旧版openai包
         response = client.chat.completions.create(
             model="openrouter/free",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": full_msg}
             ],
-            temperature=0.3
+            temperature=0.3,
+            headers=headers
         )
         ai_reply = response.choices[0].message.content
 
