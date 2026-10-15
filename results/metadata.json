@@ -1,27 +1,29 @@
 {
   "rows": 15420,
   "fraud_rows": 923,
-  "seed": 42,
-  "fit_rows": 8635,
-  "validation_rows": 2159,
+  "train_rows": 10794,
   "test_rows": 4626,
-  "selected": [
-    "Fault",
-    "BasePolicy",
-    "Year",
-    "PolicyType",
-    "Month",
-    "Age",
-    "MonthClaimed",
-    "AgeOfVehicle",
-    "Deductible",
-    "AddressChange-Claim"
+  "engineered_fields": 39,
+  "encoded_fields": 120,
+  "best_method_by_original_test_auc": "ADASYN",
+  "model_files": {
+    "SMOTE": "xgb_0.json",
+    "ENN": "xgb_1.json",
+    "SMOTE-Tomek": "xgb_2.json",
+    "ADASYN": "xgb_3.json",
+    "SMOTE-ENN": "xgb_4.json"
+  },
+  "ranking_method": "Grouped total split gain from the best original model",
+  "top10_display_only": true,
+  "original_limitations": [
+    "Preprocessing fitted before train/test split",
+    "Test set used for early stopping and best-method selection",
+    "Prediction uses all trees in the original saved Booster, as original code",
+    "Original KS calculation may split tied scores"
   ],
-  "best_method_by_validation_auc": "SMOTE-Tomek",
-  "selection_baseline_validation_auc": 0.8335051743231374,
-  "ranking_repeats": 5,
-  "threshold": 0.5,
-  "algorithm": "XGBoost",
-  "feature_representation": "Original fields; one-hot categorical encoding",
-  "note": "Raw-field selection replaces original engineered-feature workflow; results are not directly comparable."
+  "changes": [
+    "CSV input path",
+    "Native JSON model export",
+    "Result export and UI only"
+  ]
 }

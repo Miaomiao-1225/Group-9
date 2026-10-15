@@ -1,0 +1,19 @@
+# 虚拟环境文件夹
+.venv/
+.venv-1/
+
+# API密钥文件（重点！防止密钥上传github）
+.env
+
+# Python缓存
+__pycache__/
+*.pyc
+
+# 模型、输出结果
+*.pkl
+*.joblib
+results/*.png
+results/*.json
+
+# 本地数据文件
+data/*.csv
