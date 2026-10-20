@@ -22,8 +22,11 @@
     "Original KS calculation may split tied scores"
   ],
   "changes": [
-    "CSV input path",
-    "Native JSON model export",
-    "Result export and UI only"
-  ]
+  "CSV input path",
+  "Native JSON model export",
+  "Result export and interactive Streamlit dashboard",
+  "AI fraud monitoring agent with five analytical tools",
+  "OpenRouter LLM integration and automated risk report generation",
+  "API error handling and fallback analysis"
+]
 }
