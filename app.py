@@ -30,7 +30,10 @@ meta=metadata()
 data=read_csv('data/vehicle_fraud.csv')
 page=st.sidebar.radio('功能 / Explore', ['Dataset overview','Top 10 features','Original model comparison','Test case explorer','AI Risk Assistant','Validation & sharing'])
 st.sidebar.info('Top 10 is a display ranking only. Models still use ALL original engineered features.\n\n前十特征仅用于展示，模型输入未删减。')
-
+if page == 'AI Risk Assistant':
+    from fraud_agent import render_fraud_agent
+    render_fraud_agent(meta, ROOT, data)
+    st.stop()
 def download(label, frame, name):
     st.download_button(label,frame.to_csv(index=False).encode('utf-8-sig'),name,'text/csv')
 
