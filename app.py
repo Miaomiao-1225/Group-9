@@ -184,7 +184,7 @@ else:
     st.subheader('What changed / 修改范围')
     st.markdown('''**Retained:** original cleaning, every engineered field, one-hot encoding, standardization, 70:30 split, five sampling methods, original XGBoost parameters/early stopping, original metric formulas and prediction rule.
 
-**Added:** CSV reading for the supplied file; result export; native JSON model storage; Windows startup; Streamlit pages and a gain-based Top 10 display.
+**Added:** CSV data loading; result export; native JSON model storage; an interactive Streamlit dashboard; a Top 10 feature importance display; an AI-powered fraud monitoring agent with five Python analytical tools; OpenRouter LLM integration for optional AI tool selection and risk report generation; downloadable risk monitoring reports; and API error handling with fallback analysis.
 
 **Not carried over from the discarded rewrite:** ten-raw-field-only models, separate validation split, extra Baseline model and changed ENN parameters.
 
