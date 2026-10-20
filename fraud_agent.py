@@ -196,23 +196,55 @@ def _client():
         return None
     from openai import OpenAI
     # Crucial for small free-tier quotas: do not silently retry each failed call.
-    return OpenAI(api_key=key, base_url="https://openrouter.ai/api/v1", timeout=55, max_retries=0)
+    return OpenAI(api_key=key, base_url="https://openrouter.ai/api/v1", timeout=150, max_retries=0)
 
 
-def _answer(client, messages, max_tokens=800) -> str:
+def _answer(client, messages, max_tokens=3072) -> str:
     response = client.chat.completions.create(
         model=_setting("OPENROUTER_MODEL", "openrouter/free"),
         messages=messages,
         temperature=0.2,
         max_tokens=max_tokens,
+        # MiniMax M3.1 Flash always reasons before producing visible text.
+        # OpenRouter's unified reasoning control reduces the chance that
+        # thinking consumes the entire completion budget. Never set 'none'.
+        extra_body={"reasoning": {"effort": "low"}},
         extra_headers={
             "HTTP-Referer": "https://miaomiao-1225-group-9-app-gutumw.streamlit.app",
             "X-OpenRouter-Title": "Group9-Fraud-Monitor",
         },
     )
-    result = (response.choices[0].message.content or "").strip()
+    choice = response.choices[0]
+    content = choice.message.content
+    if isinstance(content, list):
+        # Compatible with content-part responses from certain providers.
+        result = "\n".join(
+            part.get("text", "") if isinstance(part, dict)
+            else str(getattr(part, "text", "") or "")
+            for part in content
+        ).strip()
+    else:
+        result = (content or "").strip()
     if not result:
-        raise ValueError("The model returned an empty response; no AI narrative was produced.")
+        finish_reason = str(getattr(choice, "finish_reason", None) or "unknown")
+        usage = getattr(response, "usage", None)
+        used = getattr(usage, "completion_tokens", None)
+        details = getattr(usage, "completion_tokens_details", None)
+        reasoning = getattr(details, "reasoning_tokens", None)
+        visible = (used - reasoning) if isinstance(used, int) and isinstance(reasoning, int) else None
+        info = f"Empty AI text (finish_reason={finish_reason}"
+        if used is not None:
+            info += f", output_tokens={used}"
+        if reasoning is not None:
+            info += f", reasoning_tokens={reasoning}"
+        if visible is not None:
+            info += f", estimated_visible_tokens={visible}"
+        info += "). "
+        if finish_reason == "length":
+            info += "The model likely spent its token budget on reasoning."
+        else:
+            info += "Provider returned no visible text; review the latest OpenRouter generation log."
+        raise ValueError(info)
     return result
 
 
@@ -256,7 +288,7 @@ def _choose_tools(client, question: str) -> tuple[list[str], str, str | None]:
         reply = _answer(client, [
             {"role": "system", "content": "Choose only available Python tools. Output valid JSON."},
             {"role": "user", "content": prompt},
-        ], max_tokens=400)
+        ], max_tokens=3072)
         match = re.search(r"\{[\s\S]*\}", reply)
         plan = json.loads(match.group(0)) if match else {}
         selected = plan.get("tools")
@@ -347,7 +379,7 @@ def _run_monitor(question: str, data: pd.DataFrame, root: Path,
                     "User task: " + question[:800] +
                     "\nPython tool outputs:\n" + json.dumps(_compact_evidence(outputs), ensure_ascii=False, default=str)
                 )},
-            ], max_tokens=1200)
+            ], max_tokens=3072)
             narrative = response
             synthesis_mode = "LLM synthesized from Python tool results"
         except Exception as exc:
