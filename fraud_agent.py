@@ -195,10 +195,11 @@ def _client():
     if not key:
         return None
     from openai import OpenAI
-    return OpenAI(api_key=key, base_url="https://openrouter.ai/api/v1", timeout=40, max_retries=1)
+    # Crucial for small free-tier quotas: do not silently retry each failed call.
+    return OpenAI(api_key=key, base_url="https://openrouter.ai/api/v1", timeout=55, max_retries=0)
 
 
-def _answer(client, messages, max_tokens=550) -> str:
+def _answer(client, messages, max_tokens=800) -> str:
     response = client.chat.completions.create(
         model=_setting("OPENROUTER_MODEL", "openrouter/free"),
         messages=messages,
@@ -209,33 +210,64 @@ def _answer(client, messages, max_tokens=550) -> str:
             "X-OpenRouter-Title": "Group9-Fraud-Monitor",
         },
     )
-    return (response.choices[0].message.content or "").strip()
+    result = (response.choices[0].message.content or "").strip()
+    if not result:
+        raise ValueError("The model returned an empty response; no AI narrative was produced.")
+    return result
 
 
-def _choose_tools(client, question: str) -> tuple[list[str], str]:
-    """LLM tool planning with an allowlist; safe fallback if provider can't answer."""
-    default = list(TOOL_NAMES)
-    if not client:
-        return default, "Rule-based fallback (API key unavailable)"
+def _error_details(exc: Exception) -> str:
+    """Report useful failure categories without exposing credentials or raw headers."""
+    status = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {}) if response is not None else {}
+    if status == 429:
+        details = "HTTP 429: OpenRouter account quota or upstream model provider is rate-limited."
+        retry_after = headers.get("retry-after") if headers else None
+        reset = headers.get("x-ratelimit-reset") if headers else None
+        if retry_after:
+            details += " Retry-After: " + str(retry_after)[:40] + "."
+        if reset:
+            details += " X-RateLimit-Reset: " + str(reset)[:50] + "."
+        details += " Check OpenRouter > API Keys / Activity / Logs to distinguish account quota from provider congestion."
+        return details
+    if status == 404:
+        return "HTTP 404: model ID is not available to your OpenRouter account. Check the model's official OpenRouter page."
+    if status == 401:
+        return "HTTP 401: API key rejected. Check the Streamlit Secret OPENROUTER_API_KEY."
+    if status == 402:
+        return "HTTP 402: insufficient credits / account billing issue."
+    if status is not None:
+        return f"HTTP {status}: the AI provider rejected this request (details in OpenRouter Logs)."
+    if isinstance(exc, ValueError):
+        return str(exc)[:200]
+    return f"AI request failed ({type(exc).__name__}); check OpenRouter Logs."
+
+
+def _choose_tools(client, question: str) -> tuple[list[str], str, str | None]:
+    """OPTIONAL 2-call mode: first call actually chooses Python tools."""
     try:
-        plan_prompt = (
-            "Choose Python analytical tools for this user monitoring task. "
-            "Return ONLY a JSON object like {\"tools\":[\"portfolio_overview\",\"fraud_segments\"]}. "
-            "Allowed tools and descriptions: " + json.dumps(TOOL_DESCRIPTION) +
-            "\nUser task: " + question[:600]
+        prompt = (
+            'Select analytical tools for this insurance-fraud monitoring request. '
+            'Return only a JSON object: {"tools": ["portfolio_overview", "fraud_segments"]}. '
+            'Valid tools: ' + json.dumps(TOOL_DESCRIPTION) +
+            '\nUser monitoring objective: ' + question[:600]
         )
-        reply = _answer(client, [{"role": "system", "content": "You are an analytics tool planner. Return JSON, nothing else."},
-                                 {"role": "user", "content": plan_prompt}], max_tokens=200)
+        reply = _answer(client, [
+            {"role": "system", "content": "Choose only available Python tools. Output valid JSON."},
+            {"role": "user", "content": prompt},
+        ], max_tokens=400)
         match = re.search(r"\{[\s\S]*\}", reply)
         plan = json.loads(match.group(0)) if match else {}
-        selected = [t for t in plan.get("tools", []) if t in ANALYTICS]
-        selected = list(dict.fromkeys(selected))
-        # Always include an overall control total for grounding and comparison.
+        selected = plan.get("tools")
+        if not isinstance(selected, list):
+            raise ValueError("Invalid tool plan returned by model")
+        selected = list(dict.fromkeys(name for name in selected if name in ANALYTICS))
         if "portfolio_overview" not in selected:
             selected.insert(0, "portfolio_overview")
-        return selected or default, "LLM-selected Python tools"
-    except Exception:
-        return default, "Rule-based fallback (tool planning failed)"
+        return selected, "LLM-selected Python tools", None
+    except Exception as exc:
+        return list(TOOL_NAMES), "Rule-based fallback (AI tool planning failed)", _error_details(exc)
 
 
 def _fallback_summary(outputs: dict) -> str:
@@ -249,84 +281,134 @@ def _fallback_summary(outputs: dict) -> str:
         first = segments["segments"][0]
         parts.append(f"- Highest displayed historical segment: {first['field']} = {first['segment']} "
                      f"({first['observed_fraud_rate_pct']:.2f}% across {first['claims']} cases; descriptive, not causal).")
+    metrics = outputs.get("model_metrics", {})
+    if metrics.get("status") == "ok" and metrics.get("models"):
+        best = max(metrics["models"], key=lambda row: row["AUC"])
+        parts.append(f"- Highest recorded test AUC among displayed methods: {best['method']} "
+                     f"({best['AUC']:.4f}); original test set influenced model selection, so this is not an independent estimate.")
+    features = outputs.get("top_features", {})
+    if features.get("status") == "ok" and features.get("features"):
+        first = features["features"][0]
+        parts.append(f"- Leading model gain-ranked field: {first['feature']} "
+                     f"({first['gain_share_pct']:.2f}% of grouped split gain; not a causal effect).")
     scores = outputs.get("highest_scored_cases", {})
     if scores.get("status") == "ok" and scores.get("highest_scored_test_cases"):
         first = scores["highest_scored_test_cases"][0]
         parts.append(f"- Highest saved {scores['selected_model']} test score: {first['score']:.4f}, "
-                     f"dataset row {first['dataset_row_index']} (not a calibrated probability).")
+                     f"dataset row {first['dataset_row_index']} (not a calibrated fraud probability).")
     bad = [x["reason"] for x in outputs.values() if x.get("status") != "ok"]
     if bad:
-        parts.append("- Not available because: " + "; ".join(bad))
-    parts.append("- Recommendations: check the flagged case segments and data integrity with a human reviewer; "
-                 "resolve merge conflicts before comparing model metrics. Do not automatically reject claims.")
-    parts.append("- Limitations: preprocessing leakage and test-informed model selection make original model "
-                 "performance unsuitable as a fully independent validation estimate.")
+        parts.append("- Unavailable evidence: " + "; ".join(bad))
+    parts.append("- Recommended action: prioritize human review of flagged historical patterns, "
+                 "validate data quality, and investigate suspected cases without automatically denying claims.")
+    parts.append("- Limitation: preprocessing leakage and test-informed model selection mean the original reported "
+                 "model metrics are not an independent generalization estimate.")
     return "\n".join(parts)
 
 
-def _run_monitor(question: str, data: pd.DataFrame, root: Path, meta: dict):
+def _compact_evidence(outputs: dict) -> dict:
+    """Only send concise evidence to the model; downloadable report keeps complete JSON."""
+    concise = {}
+    for name, result in outputs.items():
+        copy = dict(result)
+        for key, max_records in (("segments", 5), ("models", 5),
+                                 ("features", 5), ("highest_scored_test_cases", 3)):
+            if isinstance(copy.get(key), list):
+                copy[key] = copy[key][:max_records]
+        concise[name] = copy
+    return concise
+
+
+def _run_monitor(question: str, data: pd.DataFrame, root: Path,
+                 meta: dict, llm_tool_planning: bool = False):
     client = _client()
-    selected, plan_mode = _choose_tools(client, question)
+    # Default: ONE AI request per click, reserved for an evidence-grounded report.
+    # Advanced option: real AI tool planning first, with an additional API request.
+    problem = None
+    if llm_tool_planning and client:
+        selected, plan_mode, problem = _choose_tools(client, question)
+    elif llm_tool_planning and not client:
+        selected, plan_mode = list(TOOL_NAMES), "Automatic Python tools (API key missing)"
+    else:
+        selected, plan_mode = list(TOOL_NAMES), "Automatic Python analytical tools (efficient single-call mode)"
     outputs = {name: ANALYTICS[name](data, root, meta) for name in selected}
     narrative = _fallback_summary(outputs)
-    synthesis_mode = "Python-generated summary (no AI connection)"
-    if client:
+    synthesis_mode = "Python fallback; AI narrative not generated"
+    # If advanced planning failed due to a real API error, avoid a second 429.
+    if client and problem is None:
         try:
             response = _answer(client, [
                 {"role": "system", "content": SYSTEM_INSTRUCTIONS},
                 {"role": "user", "content": (
-                    "Produce a succinct risk monitoring report in Markdown. Provide: executive summary, "
-                    "quantitative findings, specific actions, and important limitations. "
-                    "Say explicitly when numeric metrics are unavailable. Do not invent values. "
-                    "\nUser's task: " + question[:1200] +
-                    "\nPython tool outputs (trusted calculations):\n" + json.dumps(outputs, ensure_ascii=False, default=str)
+                    "Write an evidence-grounded vehicle insurance fraud monitoring report in Markdown. "
+                    "Use headings: Executive Summary, Quantitative Findings, Human Review Actions, "
+                    "Limitations. Use ONLY the Python findings. NEVER invent statistics. "
+                    "Do not mention outdated merge-conflict warnings when results are available. "
+                    "User task: " + question[:800] +
+                    "\nPython tool outputs:\n" + json.dumps(_compact_evidence(outputs), ensure_ascii=False, default=str)
                 )},
-            ], max_tokens=950)
-            if response:
-                narrative, synthesis_mode = response, "LLM synthesized from Python tool results"
+            ], max_tokens=1200)
+            narrative = response
+            synthesis_mode = "LLM synthesized from Python tool results"
         except Exception as exc:
-            synthesis_mode = f"Python summary (AI synthesis failed: {type(exc).__name__})"
+            problem = _error_details(exc)
+    elif not client:
+        problem = "OPENROUTER_API_KEY not configured; Python tool report generated locally."
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     report = (
         "# Group 9 — Vehicle Insurance Fraud Risk Monitoring Report\n\n"
         f"Generated: {timestamp}\n\nTask: {question}\n\n"
         f"Tool selection: {plan_mode}\n\nTools executed: {', '.join(selected)}\n\n"
+        f"Narrative mode: {synthesis_mode}\n\n"
         + narrative + "\n\n## Auditable analytical evidence (JSON)\n\n```json\n"
         + json.dumps(outputs, indent=2, ensure_ascii=False, default=str) + "\n```\n"
     )
-    return selected, plan_mode, outputs, narrative, synthesis_mode, report
+    return selected, plan_mode, outputs, narrative, synthesis_mode, report, problem
 
 
 def render_fraud_agent(meta: dict, root: Path, data: pd.DataFrame):
     st.subheader("🤖 AI Fraud Monitoring Agent — Week 11")
-    st.write("Select analytical tools, run actual Python calculations, flag risks, and produce a downloadable report.")
-    st.caption("This monitors the historical vehicle-insurance fraud dataset; it is not an investment portfolio monitor.")
+    st.write("Execute Python risk tools, optionally let the LLM plan, and generate an evidence-grounded report.")
+    st.caption("Historical vehicle-insurance fraud monitoring; not a live portfolio or claim adjudication system.")
     if not _setting("OPENROUTER_API_KEY"):
-        st.warning("OPENROUTER_API_KEY is missing. Python analytical tools still work, but AI planning and written synthesis are disabled. Add the key to Streamlit Cloud → App Settings → Secrets.")
+        st.warning("OPENROUTER_API_KEY is missing. Configure it in Streamlit Cloud → Settings → Secrets.")
     question = st.text_area("Monitoring objective", value=(
         "Analyze historical vehicle insurance fraud risks. Compare claim segments, "
         "review available model evidence, and propose human-review priorities."
     ), height=95)
+    llm_tool_planning = st.checkbox(
+        "Advanced: let AI select Python tools (uses TWO AI requests per run)", value=False,
+        help="Leave unchecked on the free OpenRouter tier to save requests. "
+             "In efficient mode, Python automatically executes all five analysis tools and AI writes the report."
+    )
     if st.button("▶ Run Fraud Risk Agent", type="primary", disabled=not question.strip()):
-        with st.spinner("Executing analytical tools and generating report..."):
-            st.session_state.group9_agent_result = _run_monitor(question.strip(), data, root, meta)
-    if "group9_agent_result" not in st.session_state:
-        st.info("Click 'Run Fraud Risk Agent' to start. This will not retrain or modify your existing models.")
+        with st.spinner("Computing risk metrics and requesting AI analysis if available..."):
+            st.session_state.group9_agent_result_v2 = _run_monitor(
+                question.strip(), data, root, meta, llm_tool_planning=llm_tool_planning
+            )
+    if "group9_agent_result_v2" not in st.session_state:
+        st.info("Click Run Fraud Risk Agent to start. Your trained models will not be changed.")
         return
-    selected, plan_mode, outputs, narrative, synthesis_mode, report = st.session_state.group9_agent_result
-    st.success("Agent analysis completed")
+    selected, plan_mode, outputs, narrative, synthesis_mode, report, problem = \
+        st.session_state.group9_agent_result_v2
+    if problem:
+        st.warning("Python analysis completed. AI analysis not completed — the report below is a Python fallback.")
+    else:
+        st.success("Python analytics and AI synthesis completed")
     st.write("**Tool selection:**", plan_mode)
     st.write("**Python tools executed:**", ", ".join(selected))
     st.write("**Narrative mode:**", synthesis_mode)
+    if problem:
+        st.error("**AI diagnostic:** " + problem)
     overview = outputs.get("portfolio_overview", {})
     if overview.get("status") == "ok":
         a, b, c = st.columns(3)
         a.metric("Historical claims", f"{overview['records']:,}")
         b.metric("Labeled fraud cases", f"{overview['observed_fraud_cases']:,}")
         c.metric("Observed fraud rate", f"{overview['observed_fraud_rate_pct']:.2f}%")
-    problems = [record["reason"] for record in outputs.values() if record.get("status") != "ok"]
-    for issue in problems:
-        st.warning(issue)
+    for record in outputs.values():
+        if record.get("status") != "ok":
+            st.warning(record["reason"])
     st.markdown(narrative)
     with st.expander("Show actual Python tool outputs / Auditable evidence"):
         st.json(outputs)
